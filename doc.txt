@@ -1,0 +1,276 @@
+Dưới đây là một “công thức” áp dụng Quantization‑Aware Training (QAT) cho MTCNN (face detection) kèm code mẫu (PyTorch) và giải thích rõ ràng. Mục tiêu: giữ độ chính xác gần FP32 nhưng chạy nhanh hơn/nhẹ RAM (đặc biệt trên ARM/Jetson/TensorRT INT8).
+
+1) Tóm tắt nhanh: QAT + MTCNN
+
+MTCNN gồm 3 mạng nhỏ nối tầng: P‑Net (proposal), R‑Net (refine), O‑Net (output: cls + bbox + 5 landmarks). Pipeline: tạo pyramid → P‑Net → NMS → R‑Net → NMS → O‑Net + NMS cuối. 
+arXiv
+
+QAT mô phỏng lượng tử hóa trong lúc train bằng “fake quant” (Quantize/Dequantize) để mô hình học thích nghi với INT8, thường giữ được accuracy tốt hơn PTQ. 
+CVF Open Access
+PyTorch Documentation
+
+Triển khai:
+
+PyTorch/ONNX xuất Q/DQ → TensorRT đọc Q/DQ để build engine INT8 (QAT flow chính thống). 
+NVIDIA Docs
++1
+ONNX Runtime
+
+Train/finetune trên WIDER FACE (chuẩn phát hiện mặt). 
+CVF Open Access
+Shuoyang1213
+
+Lưu ý thực tế: MTCNN dùng PReLU, lớp này khó fuse; thường để PReLU ở float hoặc thay bằng ReLU/Hard‑Swish nếu cần. Ngoài ra, “điểm tin cậy” (threshold t1/t2/t3) và NMS IoU nên hiệu chỉnh lại sau QAT vì phân phối logit thay đổi nhẹ.
+
+2) Kiến trúc “quantizable” cho MTCNN
+
+Các nguyên tắc QAT áp cho cả P‑Net, R‑Net, O‑Net:
+
+Fusing: Conv + BN (+ ReLU nếu dùng) để tối ưu đồ thị trước QAT. (PyTorch FX/torch.ao.quantization hỗ trợ). 
+PyTorch Documentation
+
+QConfig: dùng per‑channel weight (symmetric) cho Conv, per‑tensor activation (affine). Backend: fbgemm (x86) hoặc qnnpack (ARM). 
+PyTorch Documentation
+
+Không lượng tử các phần hậu xử lý (image pyramid, NMS, bbox/landmark decode).
+
+Giữ float cho lớp đầu/cuối nếu thấy nhạy (ví dụ conv cuối cho landmark 5×2).
+
+3) Code mẫu (PyTorch 2.x, QAT với FX)
+
+Mục đích: cho thấy cách “chuẩn bị QAT → train ngắn (finetune) → convert/export ONNX Q/DQ → build TensorRT INT8”.
+
+# mtcnn_qat.py
+import torch, torch.nn as nn
+from torch.ao.quantization import get_default_qat_qconfig
+from torch.ao.quantization.qconfig_mapping import QConfigMapping
+from torch.ao.quantization.fx import prepare_qat_fx, convert_to_reference_fx
+
+# ---- 3.1: Các block quantizable ----
+class ConvBNAct(nn.Module):
+    def __init__(self, c_in, c_out, k, s=1, p=0, act='prelu'):
+        super().__init__()
+        self.conv = nn.Conv2d(c_in, c_out, k, s, p, bias=False)
+        self.bn   = nn.BatchNorm2d(c_out)
+        if act == 'relu':
+            self.act = nn.ReLU(inplace=True)
+        else:
+            # PReLU: để nguyên float (không fuse), QAT vẫn hoạt động với fake-quant trước/sau conv
+            self.act = nn.PReLU(num_parameters=c_out)
+    def forward(self, x):
+        x = self.conv(x); x = self.bn(x); x = self.act(x)
+        return x
+
+class PNet(nn.Module):
+    """P-Net đơn giản hoá (đủ cho minh hoạ)."""
+    def __init__(self, act='prelu'):
+        super().__init__()
+        self.body = nn.Sequential(
+            ConvBNAct(3, 10, 3, 1, 0, act),
+            nn.MaxPool2d(2,2),
+            ConvBNAct(10, 16, 3, 1, 0, act),
+            ConvBNAct(16, 32, 3, 1, 0, act)
+        )
+        # heads
+        self.cls_head = nn.Conv2d(32, 2, 1)     # face / non-face
+        self.box_head = nn.Conv2d(32, 4, 1)     # bbox offset
+        self.lmk_head = nn.Conv2d(32, 10, 1)    # 5 landmarks
+    def forward(self, x):
+        f = self.body(x)
+        return self.cls_head(f), self.box_head(f), self.lmk_head(f)
+
+class RNet(nn.Module):
+    def __init__(self, act='prelu'):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            ConvBNAct(3, 28, 3, 1, 1, act), nn.MaxPool2d(3,2),
+            ConvBNAct(28, 48, 3, 1, 1, act), nn.MaxPool2d(3,2),
+            ConvBNAct(48, 64, 2, 1, 0, act)
+        )
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(64*3*3, 128), nn.PReLU(128))
+        self.cls = nn.Linear(128, 2)
+        self.box = nn.Linear(128, 4)
+        self.lmk = nn.Linear(128, 10)
+    def forward(self, x):
+        f = self.backbone(x); f = self.fc(f)
+        return self.cls(f), self.box(f), self.lmk(f)
+
+class ONet(nn.Module):
+    def __init__(self, act='prelu'):
+        super().__init__()
+        self.backbone = nn.Sequential(
+            ConvBNAct(3, 32, 3, 1, 1, act), nn.MaxPool2d(3,2),
+            ConvBNAct(32, 64, 3, 1, 1, act), nn.MaxPool2d(3,2),
+            ConvBNAct(64, 64, 3, 1, 1, act), nn.MaxPool2d(2,2),
+            ConvBNAct(64,128, 2, 1, 0, act)
+        )
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(128*3*3, 256), nn.PReLU(256))
+        self.cls = nn.Linear(256, 2)
+        self.box = nn.Linear(256, 4)
+        self.lmk = nn.Linear(256, 10)
+    def forward(self, x):
+        f = self.backbone(x); f = self.fc(f)
+        return self.cls(f), self.box(f), self.lmk(f)
+
+# ---- 3.2: Chuẩn bị QAT (FX) ----
+def make_qat(model: nn.Module, backend='qnnpack'):
+    model.train()
+    # Chọn backend: 'fbgemm' (x86), 'qnnpack' (ARM)
+    qconfig = get_default_qat_qconfig(backend)
+    qmap = QConfigMapping().set_global(qconfig)
+
+    example = torch.randn(1,3,48,48)  # ví dụ input cho chuẩn bị đồ thị
+    prepared = prepare_qat_fx(model, qconfig_mapping=qmap, example_inputs=example)
+
+    # Mẹo QAT ổn định: bật observer trước ~3-5 epoch đầu, sau đó freeze, rồi freeze BN
+    for m in prepared.modules():
+        if hasattr(m, 'fake_quant_enabled'):
+            m.fake_quant_enabled = True
+        if hasattr(m, 'observer_enabled'):
+            m.observer_enabled = True
+    return prepared
+
+# ---- 3.3: Convert sang “reference” (Q/DQ friendly) để export ONNX ----
+def convert_for_export(prepared: nn.Module):
+    prepared.eval()
+    # Convert reference giữ Q/DQ (quantize_per_tensor/per_channel) thay vì int8 phần cứng
+    ref = convert_to_reference_fx(prepared)
+    return ref
+
+if __name__ == "__main__":
+    pnet = PNet()
+    pnet_qat = make_qat(pnet, backend='qnnpack')  # ARM/Jetson
+
+    # (train/finetune vài epoch với WIDER FACE crop/patch cho P-Net...)
+    # ... cập nhật loss: cls (CE), box (SmoothL1), lmk (SmoothL1) có trọng số
+    # Sau warmup: freeze observer -> m.observer_enabled=False, rồi freeze BN
+    # Cuối cùng:
+    ref = convert_for_export(pnet_qat)
+
+    # Xuất ONNX với Q/DQ
+    dummy = torch.randn(1,3,48,48)
+    torch.onnx.export(ref, dummy, "pnet_qat_qdq.onnx", opset_version=19, do_constant_folding=True)
+    print("Exported: pnet_qat_qdq.onnx")
+
+
+Vì sao convert_to_reference_fx? Để mô hình giữ các toán tử Q/DQ (fake‑quant) trong đồ thị ONNX; TensorRT coi đó là QAT model và build engine INT8 chính xác hơn. 
+NVIDIA Docs
++1
+ONNX Runtime
+
+Huấn luyện thực sự: bạn lặp tương tự cho R‑Net (đầu vào cắt từ P‑Net sau NMS) và O‑Net (đầu vào cắt từ R‑Net), mỗi mạng finetune ngắn 3–10 epoch QAT là thường đủ để hồi phục độ chính xác.
+
+4) Vòng lặp train (minh họa; P‑Net)
+# train_qat_pnet.py (rút gọn, minh hoạ)
+import torch, torch.nn as nn, torch.optim as optim
+from mtcnn_qat import PNet, make_qat, convert_for_export
+
+cls_crit  = nn.CrossEntropyLoss()
+box_crit  = nn.SmoothL1Loss()
+lmk_crit  = nn.SmoothL1Loss()
+
+def step(pnet_qat, batch, opt, epoch, freeze_obs_epoch=3, freeze_bn_epoch=5):
+    imgs, cls_t, box_t, lmk_t = batch  # đã chuẩn bị theo pipeline MTCNN
+    logits, box_p, lmk_p = pnet_qat(imgs)
+
+    # logits: N×2×H×W -> vector anchor positives/negatives (tuỳ implement mining)
+    # Ở đây minh hoạ: giả sử đã sample ra Np điểm/anchor
+    cls_loss = cls_crit(logits, cls_t)
+    box_loss = box_crit(box_p, box_t)
+    lmk_loss = lmk_crit(lmk_p, lmk_t)
+    loss = cls_loss + 0.5*box_loss + 0.5*lmk_loss
+
+    opt.zero_grad(); loss.backward(); opt.step()
+
+    # quản lý observer & BN theo lịch
+    if epoch == freeze_obs_epoch:
+        for m in pnet_qat.modules():
+            if hasattr(m, 'observer_enabled'):
+                m.observer_enabled = False
+    if epoch == freeze_bn_epoch:
+        pnet_qat.apply(lambda m: isinstance(m, nn.BatchNorm2d) and m.eval())
+    return loss.item()
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pnet = PNet().to(device)
+    pnet_qat = make_qat(pnet, backend="qnnpack").to(device)
+    opt = optim.Adam(pnet_qat.parameters(), lr=1e-4)
+
+    # TODO: DataLoader WIDER FACE (crop pyramid patches + labels)
+    for epoch in range(8):
+        for batch in train_loader:  # giả định có
+            batch = [b.to(device) for b in batch]
+            loss = step(pnet_qat, batch, opt, epoch)
+
+    ref = convert_for_export(pnet_qat.cpu())
+    torch.onnx.export(ref, torch.randn(1,3,48,48), "pnet_qat_qdq.onnx", opset_version=19)
+
+
+Gợi ý thực hành từ QAT chuẩn: bật/đóng observer (đo min/max) và “đóng băng” BatchNorm ở nửa sau training để ổn định scale/zero‑point; đây là recipe được khuyến nghị trong PyTorch QAT. 
+PyTorch Documentation
+
+5) Build TensorRT INT8 từ QAT (ONNX Q/DQ)
+
+Sau khi có *_qat_qdq.onnx cho P‑Net/R‑Net/O‑Net:
+
+# TensorRT 10.x (Jetson Orin Nano / x86 GPU)
+trtexec --onnx=pnet_qat_qdq.onnx --int8 --saveEngine=pnet_int8.plan --workspace=4096
+trtexec --onnx=rnet_qat_qdq.onnx --int8 --saveEngine=rnet_int8.plan --workspace=4096
+trtexec --onnx=onet_qat_qdq.onnx --int8 --saveEngine=onet_int8.plan --workspace=4096
+
+
+TensorRT sẽ nhận các Q/DQ từ ONNX như biểu diễn QAT chuẩn; đây là explicit quantization (khuyến nghị, thay cho implicit cũ). 
+NVIDIA Docs
++1
+
+Nếu bạn thích Torch‑TensorRT: có notebook “Deploying QAT INT8” (tham khảo flow end‑to‑end). 
+PyTorch Documentation
+
+6) Điều chỉnh hậu xử lý sau QAT
+
+Ngưỡng t1/t2/t3 (score face) có thể lệch do lượng tử; quét grid nhỏ (±0.05 quanh ngưỡng cũ) để tối ưu mAP/recall.
+
+NMS IoU: đôi khi cần giảm nhẹ (vd 0.7 → 0.65) cho P‑Net để tránh rớt candidate.
+
+Landmark head: nếu sai lệch tăng, cân nhắc giữ float cho linear cuối O‑Net hoặc tăng trọng số landmark loss trong finetune.
+
+Về mặt học thuật, QAT giúp giữ accuracy tốt hơn PTQ trên detection (COCO/RetinaNet, v.v.) khi lượng tử xuống INT8. 
+arXiv
+NVIDIA Developer
+
+7) Dataset & đánh giá
+
+WIDER FACE: 32k ảnh / 393k mặt, chia Easy/Medium/Hard; dùng để huấn luyện/đánh giá detect. 
+CVF Open Access
+
+Theo MTCNN gốc: tối ưu đa nhiệm (cls + bbox + 5 lmk) với mining khó online. 
+arXiv
+
+Khi báo cáo: so sánh AP/mAP từng split + latency/RAM FP32 vs INT8.
+
+8) Mẹo & bẫy thường gặp
+
+PReLU: nếu “giòn” khi INT8, để float (exclude khỏi QAT) hoặc thay bằng ReLU; giữ Conv quantized. (Kinh nghiệm cộng đồng: quantize MTCNN P‑Net không cẩn thận có thể “rỗng kết quả”). 
+GitHub
+
+First/last layers: có thể bỏ qua lượng tử (qconfig=None) nếu giảm sai số đầu/cuối. 
+PyTorch Documentation
+
+Per‑channel cho Conv: ổn định hơn per‑tensor khi INT8. 
+CVF Open Access
+
+Export ONNX opset: dùng ≥19 để Q/DQ ổn; TensorRT cảnh báo một số đặc tả mới chưa hỗ trợ đầy đủ → dùng bản TRT tương thích. 
+NVIDIA Docs
+
+9) Tại sao QAT là hướng “chuẩn” cho INT8 trên Edge/Jetson?
+
+Jacob et al. (CVPR’18) giới thiệu lộ trình integer‑only inference + QAT đồng thiết kế, là nền tảng cho QAT hiện đại. 
+CVF Open Access
++1
+
+PyTorch QAT (fake‑quant + observer) là pipeline thực thi phổ biến, hỗ trợ fuse, per‑channel, và xuất Q/DQ. 
+PyTorch Documentation
+
+TensorRT hỗ trợ QAT explicit (Q/DQ)—đây là con đường đáng tin cậy để đạt FP32‑like accuracy trên INT8. 
+NVIDIA Developer
